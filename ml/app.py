@@ -36,12 +36,23 @@ MODEL_ID = "black-forest-labs/FLUX.2-klein-9B"
 
 # Request schema
 class TryOnRequest(BaseModel):
-    prompt: str
-    reference_images: list[str]  # base64 encoded images
+    item_name: str
+    item_brand: str
+    item_category: str
+    item_color: str
+    face: str
+    full_body: str
+    item_front: str
+    item_back: str
+    model_front: str
+    model_back: str
+    # Person metadata
+    height_cm: int
+    weight_kg: int
+    build: str  # slim, athletic, average, large
     height: Optional[int] = 1024
     width: Optional[int] = 1024
-    num_inference_steps: Optional[int] = 4
-    guidance_scale: Optional[float] = 1.0
+    num_inference_steps: Optional[int] = 28
 
 
 @app.cls(
@@ -90,14 +101,14 @@ class FluxInference:
         reference_images = request["reference_images"]
         height = request.get("height", 1024)
         width = request.get("width", 1024)
-        num_inference_steps = request.get("num_inference_steps", 4)
-        guidance_scale = request.get("guidance_scale", 1.0)
+        num_inference_steps = request.get("num_inference_steps", 28)
 
         # Decode base64 reference images
         ref_images = []
         for img_b64 in reference_images:
             img_bytes = base64.b64decode(img_b64)
             img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            img = img.resize((768, 768))
             ref_images.append(img)
 
         # Run inference
@@ -107,7 +118,6 @@ class FluxInference:
             height=height,
             width=width,
             num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
             generator=torch.Generator().manual_seed(42),
         ).images[0]
 
@@ -132,5 +142,34 @@ def fastapi_app():
 
 @web_app.post("/try-on")
 async def try_on(request: TryOnRequest):
-    result = await FluxInference().run_inference.remote.aio(request.dict())
+    prompt = (
+        f"The exact same person from the reference photos wearing a {request.item_color} {request.item_name} by {request.item_brand}. "
+        f"Use the first and second reference images to preserve the person's face, skin tone, hair, and facial features exactly — identical likeness, same person. "
+        f"The person is {request.height_cm}cm tall, weighs {request.weight_kg}kg, and has a {request.build} build. "
+        f"Use the third reference image to preserve the person's body proportions exactly — correct leg to torso ratio, natural human proportions from head to toe. "
+        f"Use the fourth and fifth reference images to reproduce the {request.item_category} exactly, "
+        f"preserving all details, patches, graphics, colors, and textures precisely. "
+        f"Use the sixth and seventh reference images to understand exactly how the garment fits, drapes, "
+        f"and sits on a person's body, including sleeve length, shoulder fit, and overall silhouette. "
+        f"Standing upright, neutral pose, arms relaxed at sides, facing forward, full body visible from head to toe. "
+        f"Fashion photography, clean neutral background, high quality, photorealistic."
+    )
+
+    reference_images = [
+        request.face,             # 1st - face reference
+        request.face,             # 2nd - face reference repeated for stronger conditioning
+        request.full_body,        # 3rd - body proportions
+        request.item_front,       # 4th - item front
+        request.item_back,        # 5th - item back
+        request.model_front,      # 6th - item fit front
+        request.model_back,       # 7th - item fit back
+    ]
+
+    result = await FluxInference().run_inference.remote.aio({
+        "prompt": prompt,
+        "reference_images": reference_images,
+        "height": request.height,
+        "width": request.width,
+        "num_inference_steps": request.num_inference_steps,
+    })
     return result
