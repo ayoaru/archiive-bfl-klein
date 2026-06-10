@@ -18,6 +18,8 @@ image = (
         "pydantic",
         "python-multipart",
         "Pillow",
+        "rembg",
+        "onnxruntime",
     )
 )
 
@@ -68,6 +70,24 @@ class FashnInference:
         self.pipeline = TryOnPipeline(weights_dir=WEIGHTS_DIR)
         print("Model loaded successfully.")
 
+    def remove_background(self, image):
+        """Remove background from garment image using rembg."""
+        from rembg import remove
+        from PIL import Image
+        import numpy as np
+
+        print("Removing garment background...")
+
+        # Remove background — returns RGBA image
+        result = remove(image)
+
+        # Paste onto white background for FASHN VTON
+        white_bg = Image.new("RGB", result.size, (255, 255, 255))
+        white_bg.paste(result, mask=result.split()[3])  # use alpha as mask
+
+        print("Background removed.")
+        return white_bg
+
     @modal.method()
     def run_inference(self, request):
         from PIL import Image
@@ -81,6 +101,9 @@ class FashnInference:
         category = request["category"]
         num_timesteps = request.get("num_timesteps", 50)
         guidance_scale = request.get("guidance_scale", 2.0)
+
+        # Remove background from garment image
+        garment_image = self.remove_background(garment_image)
 
         print(f"Running inference — category: {category}")
 
