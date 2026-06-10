@@ -3,12 +3,21 @@ import io
 import base64
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 
 # Define the Modal image with all required dependencies
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("git")
+    .apt_install(
+        "git",
+        "libgl1",
+        "libglib2.0-0",
+        "wget",
+        "libgles2",
+        "libegl1",
+        "libglfw3",
+        "libgles2-mesa",
+    )
     .pip_install(
         "torch",
         "torchvision",
@@ -23,6 +32,13 @@ image = (
         "fastapi",
         "pydantic",
         "python-multipart",
+        "opencv-python",
+        "mediapipe",
+        "numpy",
+    )
+    .run_commands(
+        "wget -O /root/blaze_face_short_range.tflite "
+        "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
     )
 )
 
@@ -70,7 +86,6 @@ class FluxInference:
         from huggingface_hub import snapshot_download
         import os
 
-        # Download model weights to volume if not already cached
         if not os.path.exists(f"{MODEL_DIR}/model_index.json"):
             print("Downloading model weights...")
             snapshot_download(
@@ -83,7 +98,6 @@ class FluxInference:
         else:
             print("Loading model from cache...")
 
-        # Load the pipeline
         self.pipe = Flux2KleinPipeline.from_pretrained(
             MODEL_DIR,
             torch_dtype=torch.bfloat16,
@@ -91,43 +105,187 @@ class FluxInference:
         self.pipe.enable_model_cpu_offload()
         print("Model loaded successfully.")
 
+    def detect_face_mask(self, image):
+        """Use MediaPipe to detect face and generate an inpainting mask."""
+        import mediapipe as mp
+        import numpy as np
+        import cv2
+        from PIL import Image
+
+        img_array = np.array(image)
+        h, w = img_array.shape[:2]
+
+        base_options = mp.tasks.BaseOptions(
+            model_asset_path="/root/blaze_face_short_range.tflite"
+        )
+        options = mp.tasks.vision.FaceDetectorOptions(
+            base_options=base_options,
+            min_detection_confidence=0.2,
+        )
+
+        with mp.tasks.vision.FaceDetector.create_from_options(options) as detector:
+            mp_image = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+            )
+            results = detector.detect(mp_image)
+
+        print(f"Face detections found: {len(results.detections)}")
+
+        if not results.detections:
+            print("No face detected in Stage 1 output — skipping Stage 2.")
+            return None
+
+        detection = results.detections[0]
+        bbox = detection.bounding_box
+
+        x = bbox.origin_x
+        y = bbox.origin_y
+        bw = bbox.width
+        bh = bbox.height
+
+        # Expand bounding box by 40% to include hairline and neck
+        padding_x = int(bw * 0.4)
+        padding_y = int(bh * 0.4)
+        x = max(0, x - padding_x)
+        y = max(0, y - padding_y)
+        bw = min(w - x, bw + padding_x * 2)
+        bh = min(h - y, bh + padding_y * 2)
+
+        mask = np.zeros((h, w), dtype=np.uint8)
+        mask[y:y+bh, x:x+bw] = 255
+
+        return Image.fromarray(mask).convert("RGB")
+
     @modal.method()
     def run_inference(self, request):
         import torch
         from PIL import Image
 
-        # Extract fields from dict
-        prompt = request["prompt"]
-        reference_images = request["reference_images"]
         height = request.get("height", 1024)
         width = request.get("width", 1024)
         num_inference_steps = request.get("num_inference_steps", 28)
+        height_cm = request["height_cm"]
+        weight_kg = request["weight_kg"]
+        build = request["build"]
+        item_name = request["item_name"]
+        item_brand = request["item_brand"]
+        item_category = request["item_category"]
+        item_color = request["item_color"]
 
-        # Decode base64 reference images
-        ref_images = []
-        for img_b64 in reference_images:
-            img_bytes = base64.b64decode(img_b64)
+        def decode_image(b64_str, size=(768, 768)):
+            img_bytes = base64.b64decode(b64_str)
             img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-            img = img.resize((768, 768))
-            ref_images.append(img)
+            return img.resize(size, Image.LANCZOS)
 
-        # Run inference
-        result = self.pipe(
-            prompt=prompt,
-            image=ref_images,
+        # ============= Stage 1 — Outfit Generation =============
+        print("Stage 1: Generating outfit...")
+
+        stage1_prompt = (
+            f"A person with {build} build, {height_cm}cm tall, {weight_kg}kg, "
+            f"wearing a {item_color} {item_name} by {item_brand}. "
+            f"Use the first reference image to preserve the person's body proportions, "
+            f"posture, and build exactly — correct leg to torso ratio, natural human proportions from head to toe. "
+            f"Use the second and third reference images to reproduce the {item_category} exactly, "
+            f"preserving all details, graphics, colors, and textures precisely. "
+            f"Use the fourth and fifth reference images to understand exactly how the garment fits, "
+            f"drapes, and sits on the body, including sleeve length, shoulder fit, and overall silhouette. "
+            f"Standing upright, neutral pose, arms relaxed at sides, facing forward, "
+            f"full body visible from head to toe. "
+            f"Fashion photography, clean neutral background, high quality, photorealistic."
+        )
+
+        stage1_refs = [
+            decode_image(request["full_body"]),    # 1st - body proportions
+            decode_image(request["item_front"]),   # 2nd - item front
+            decode_image(request["item_back"]),    # 3rd - item back
+            decode_image(request["model_front"]),  # 4th - garment fit front
+            decode_image(request["model_back"]),   # 5th - garment fit back
+        ]
+
+        stage1_result = self.pipe(
+            prompt=stage1_prompt,
+            image=stage1_refs,
             height=height,
             width=width,
             num_inference_steps=num_inference_steps,
             generator=torch.Generator().manual_seed(42),
         ).images[0]
 
-        # Encode output image as base64
+        print("Stage 1 complete.")
+
+        # ============= Stage 2 — Face Inpainting =============
+        print("Stage 2: Applying face...")
+
+        face_mask = None
+        try:
+            face_mask = self.detect_face_mask(stage1_result)
+        except Exception as e:
+            print(f"Face detection failed: {e}")
+
+        if face_mask is None:
+            print("Skipping Stage 2 — no face detected.")
+            buffer = io.BytesIO()
+            stage1_result.save(buffer, format="PNG")
+            stage1_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+            return {
+                "image": stage1_b64,
+                "stage": "stage1_only",
+                "reason": "no face detected"
+            }
+
+        face_photo = decode_image(request["face"], size=(1024, 1024))
+
+        stage2_prompt = (
+            f"The exact same person from the reference photo. "
+            f"Preserve the person's face, skin tone, hair color, eye color, "
+            f"and all facial features exactly — identical likeness. "
+            f"Photorealistic, high quality, natural lighting, clean neutral background, "
+            f"full body shot, standing upright."
+        )
+
+        stage2_refs = [
+            decode_image(request["face"], size=(1024, 1024)),
+            decode_image(request["face"], size=(1024, 1024)),
+            stage1_result.resize((768, 768)),  # Stage 1 result as additional context
+        ]
+
+        stage2_result = self.pipe(
+            prompt=stage2_prompt,
+            image=stage2_refs,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            generator=torch.Generator().manual_seed(42),
+        ).images[0]
+
+        print("Stage 2 complete.")
+
+        # Composite Stage 2 face onto Stage 1 body using the mask
+        from PIL import Image as PILImage
+        import numpy as np
+
+        # Resize everything to the same size
+        stage1_arr = np.array(stage1_result.resize((width, height)))
+        stage2_arr = np.array(stage2_result.resize((width, height)))
+        mask_arr = np.array(face_mask.resize((width, height)).convert("L"))
+
+        # Normalize mask to 0-1
+        mask_normalized = mask_arr.astype(float) / 255.0
+        mask_3ch = np.stack([mask_normalized] * 3, axis=-1)
+
+        # Blend: use Stage 2 face where mask is white, Stage 1 body where mask is black
+        composited = (stage2_arr * mask_3ch + stage1_arr * (1 - mask_3ch)).astype(np.uint8)
+        final_result = PILImage.fromarray(composited)
+
+        print("Compositing complete.")
+
+        # Encode final output as base64
         buffer = io.BytesIO()
-        result.save(buffer, format="PNG")
+        final_result.save(buffer, format="PNG")
         output_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
         return {"image": output_b64}
-
 
 # FastAPI web endpoint
 web_app = FastAPI()
@@ -135,6 +293,7 @@ web_app = FastAPI()
 @app.function(
     secrets=[modal.Secret.from_name("huggingface")],
     image=image,
+    timeout=300,
 )
 @modal.asgi_app()
 def fastapi_app():
@@ -142,32 +301,20 @@ def fastapi_app():
 
 @web_app.post("/try-on")
 async def try_on(request: TryOnRequest):
-    prompt = (
-        f"The exact same person from the reference photos wearing a {request.item_color} {request.item_name} by {request.item_brand}. "
-        f"Use the first and second reference images to preserve the person's face, skin tone, hair, and facial features exactly — identical likeness, same person. "
-        f"The person is {request.height_cm}cm tall, weighs {request.weight_kg}kg, and has a {request.build} build. "
-        f"Use the third reference image to preserve the person's body proportions exactly — correct leg to torso ratio, natural human proportions from head to toe. "
-        f"Use the fourth and fifth reference images to reproduce the {request.item_category} exactly, "
-        f"preserving all details, patches, graphics, colors, and textures precisely. "
-        f"Use the sixth and seventh reference images to understand exactly how the garment fits, drapes, "
-        f"and sits on a person's body, including sleeve length, shoulder fit, and overall silhouette. "
-        f"Standing upright, neutral pose, arms relaxed at sides, facing forward, full body visible from head to toe. "
-        f"Fashion photography, clean neutral background, high quality, photorealistic."
-    )
-
-    reference_images = [
-        request.face,             # 1st - face reference
-        request.face,             # 2nd - face reference repeated for stronger conditioning
-        request.full_body,        # 3rd - body proportions
-        request.item_front,       # 4th - item front
-        request.item_back,        # 5th - item back
-        request.model_front,      # 6th - item fit front
-        request.model_back,       # 7th - item fit back
-    ]
-
     result = await FluxInference().run_inference.remote.aio({
-        "prompt": prompt,
-        "reference_images": reference_images,
+        "item_name": request.item_name,
+        "item_brand": request.item_brand,
+        "item_category": request.item_category,
+        "item_color": request.item_color,
+        "face": request.face,
+        "full_body": request.full_body,
+        "item_front": request.item_front,
+        "item_back": request.item_back,
+        "model_front": request.model_front,
+        "model_back": request.model_back,
+        "height_cm": request.height_cm,
+        "weight_kg": request.weight_kg,
+        "build": request.build,
         "height": request.height,
         "width": request.width,
         "num_inference_steps": request.num_inference_steps,
