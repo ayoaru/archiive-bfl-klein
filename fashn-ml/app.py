@@ -35,6 +35,7 @@ class TryOnRequest(BaseModel):
     person_image: str       # base64
     garment_image: str      # base64
     category: str           # "tops" | "bottoms" | "one-pieces"
+    garment_photo_type: str # "auto" | "model" | "flat-lay"
     num_timesteps: Optional[int] = 50
     guidance_scale: Optional[float] = 2.0
 
@@ -99,6 +100,7 @@ class FashnInference:
         person_image = decode_image(request["person_image"])
         garment_image = decode_image(request["garment_image"])
         category = request["category"]
+        garment_photo_type = request["garment_photo_type"]
         num_timesteps = request.get("num_timesteps", 50)
         guidance_scale = request.get("guidance_scale", 2.0)
 
@@ -111,6 +113,7 @@ class FashnInference:
             person_image=person_image,
             garment_image=garment_image,
             category=category,
+            garment_photo_type=garment_photo_type,
             num_timesteps=num_timesteps,
             guidance_scale=guidance_scale,
         )
@@ -141,6 +144,7 @@ async def try_on(request: TryOnRequest):
         "person_image": request.person_image,
         "garment_image": request.garment_image,
         "category": request.category,
+        "garment_photo_type": request.garment_photo_type,
         "num_timesteps": request.num_timesteps,
         "guidance_scale": request.guidance_scale,
     })
