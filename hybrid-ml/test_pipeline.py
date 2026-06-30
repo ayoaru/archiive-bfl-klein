@@ -81,6 +81,8 @@ def main() -> None:
     parser.add_argument("--item-brand", default="Test Brand")
     parser.add_argument("--item-category", default="hoodie")
     parser.add_argument("--item-color", default="black")
+    parser.add_argument("--garment-photo-type", default="auto", choices=["auto", "model", "flat-lay"],
+                        help="How FASHN interprets the garment image (affects fit/hem).")
     parser.add_argument("--seed", type=int, default=None,
                         help="Omit for a fresh random result; pass a value to reproduce one.")
     parser.add_argument("--num-timesteps", type=int, default=50, help="FASHN steps.")
@@ -92,6 +94,8 @@ def main() -> None:
                         help="Explicit output PNG path; overrides --output-dir "
                              "(default name: <output-dir>/<timestamp>_seed<seed>.png).")
     parser.add_argument("--no-open", action="store_true", help="Don't auto-open the result.")
+    parser.add_argument("--debug", action="store_true",
+                        help="Also save the raw Stage 1 (FASHN) and FLUX outputs next to the result.")
     args = parser.parse_args()
 
     if not args.url:
@@ -111,10 +115,12 @@ def main() -> None:
         "item_brand": args.item_brand,
         "item_category": args.item_category,
         "item_color": args.item_color,
+        "garment_photo_type": args.garment_photo_type,
         "num_timesteps": args.num_timesteps,
         "guidance_scale": args.guidance_scale,
         "flux_steps": args.flux_steps,
         "seed": args.seed,
+        "debug": args.debug,
     }
 
     print(f"POST {endpoint}  (seed={args.seed if args.seed is not None else 'random'})")
@@ -135,6 +141,14 @@ def main() -> None:
     out_path.write_bytes(base64.b64decode(data["image"]))
 
     print(f"Done in {time.time() - start:.1f}s  ->  {out_path}  (seed={seed})")
+
+    # In debug mode, save the raw Stage 1 / FLUX images beside the result so we
+    # can see which stage a hem/fit artifact comes from.
+    for key, suffix in (("stage1_image", "stage1"), ("flux_image", "flux")):
+        if key in data:
+            side_path = out_path.with_name(f"{out_path.stem}_{suffix}.png")
+            side_path.write_bytes(base64.b64decode(data[key]))
+            print(f"  debug: {side_path}")
 
     if not args.no_open:
         try:
