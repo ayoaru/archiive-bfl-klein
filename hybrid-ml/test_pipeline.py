@@ -94,6 +94,8 @@ def main() -> None:
                         help="Explicit output PNG path; overrides --output-dir "
                              "(default name: <output-dir>/<timestamp>_seed<seed>.png).")
     parser.add_argument("--no-open", action="store_true", help="Don't auto-open the result.")
+    parser.add_argument("--no-face-swap", dest="face_swap", action="store_false",
+                        help="Skip Stage 3 face swap (return FLUX's own face).")
     parser.add_argument("--debug", action="store_true",
                         help="Also save the raw Stage 1 (FASHN) and FLUX outputs next to the result.")
     args = parser.parse_args()
@@ -120,6 +122,7 @@ def main() -> None:
         "guidance_scale": args.guidance_scale,
         "flux_steps": args.flux_steps,
         "seed": args.seed,
+        "face_swap": args.face_swap,
         "debug": args.debug,
     }
 
@@ -141,6 +144,8 @@ def main() -> None:
     out_path.write_bytes(base64.b64decode(data["image"]))
 
     print(f"Done in {time.time() - start:.1f}s  ->  {out_path}  (seed={seed})")
+    if "face_swap" in data:
+        print(f"  face swap: {data['face_swap']}")
 
     # In debug mode, save the raw Stage 1 / FLUX images beside the result so we
     # can see which stage a hem/fit artifact comes from.

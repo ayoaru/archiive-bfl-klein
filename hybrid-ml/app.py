@@ -8,7 +8,7 @@ from typing import Optional
 # Define the Modal image with all required dependencies
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("git", "libgl1", "libglib2.0-0")
+    .apt_install("git", "libgl1", "libglib2.0-0", "build-essential", "cmake")
     .run_commands(
         "git clone https://github.com/fashn-AI/fashn-vton-1.5.git /root/fashn-vton-1.5 && "
         "cd /root/fashn-vton-1.5 && pip install -e ."
@@ -30,6 +30,10 @@ image = (
         "rembg",
         "onnxruntime",
         "numpy",
+        # Face swap (Stage 3): restore the real face onto the FLUX output.
+        "insightface",
+        "opencv-python-headless",
+        "onnx",
     )
 )
 
@@ -39,9 +43,11 @@ app = modal.App("archiive-ml", image=image)
 # Separate volumes for each model's weights
 fashn_volume = modal.Volume.from_name("archiive-fashn-weights", create_if_missing=True)
 flux_volume = modal.Volume.from_name("archiive-model-weights", create_if_missing=True)
+face_volume = modal.Volume.from_name("archiive-face-weights", create_if_missing=True)
 
 FASHN_WEIGHTS_DIR = "/fashn-weights"
 FLUX_MODEL_DIR = "/flux-weights"
+FACE_WEIGHTS_DIR = "/face-weights"
 FLUX_MODEL_ID = "black-forest-labs/FLUX.2-klein-9B"
 
 
@@ -69,6 +75,7 @@ class TryOnRequest(BaseModel):
     guidance_scale: Optional[float] = 2.0   # FASHN guidance
     flux_steps: Optional[int] = 28          # FLUX steps
     seed: Optional[int] = None              # FLUX seed; None → random (for "regenerate")
+    face_swap: Optional[bool] = True        # swap the real face back onto the FLUX output
     white_background: Optional[bool] = True # remove subject background → white backdrop
     debug: Optional[bool] = False           # also return raw Stage 1 + FLUX images
 
@@ -79,18 +86,11 @@ class TryOnRequest(BaseModel):
     volumes={
         FASHN_WEIGHTS_DIR: fashn_volume,
         FLUX_MODEL_DIR: flux_volume,
+        FACE_WEIGHTS_DIR: face_volume,
     },
     timeout=300,
 )
 class HybridInference:
-
-    # SegFormer (mattmdjaga/segformer_b2_clothes) label ids per garment category.
-    # 4=Upper-clothes, 5=Skirt, 6=Pants, 7=Dress
-    CATEGORY_LABELS = {
-        "tops": [4],
-        "bottoms": [5, 6],
-        "one-pieces": [7],
-    }
 
     @modal.enter()
     def load_models(self):
@@ -140,60 +140,73 @@ class HybridInference:
         self.flux_pipeline.enable_model_cpu_offload()
         print("FLUX.2 [klein] loaded successfully.")
 
-        # ============= Load clothing segmentation (for garment masking) =============
-        from transformers import SegformerImageProcessor, AutoModelForSemanticSegmentation
-        self.seg_processor = SegformerImageProcessor.from_pretrained(
-            "mattmdjaga/segformer_b2_clothes"
-        )
-        self.seg_model = AutoModelForSemanticSegmentation.from_pretrained(
-            "mattmdjaga/segformer_b2_clothes"
-        )
-        self.seg_model.eval()
-        print("Clothing segmentation model loaded.")
+        # ============= Load InsightFace (Stage 3 — face swap) =============
+        # buffalo_l = face detection + embedding; inswapper_128 = the swap model.
+        # Cache both in the face volume so cold starts don't re-download.
+        os.environ["INSIGHTFACE_HOME"] = FACE_WEIGHTS_DIR
+        import insightface
+        from insightface.app import FaceAnalysis
 
-    def segment_garment_region(self, image, category):
-        """Return a raw boolean mask (numpy, image-sized) of the garment region on
-        `image`, or None if no garment pixels are found. No dilation/feather —
-        callers combine and shape it."""
-        import torch
+        self.face_app = FaceAnalysis(
+            name="buffalo_l", root=FACE_WEIGHTS_DIR,
+            providers=["CPUExecutionProvider"],
+        )
+        self.face_app.prepare(ctx_id=0, det_size=(640, 640))
+
+        swapper_path = f"{FACE_WEIGHTS_DIR}/models/inswapper_128.onnx"
+        if not os.path.exists(swapper_path):
+            # insightface's own auto-download (GitHub releases v0.7) is dead, so
+            # fetch the weights from a HF mirror instead. To use your own file
+            # instead, drop it at swapper_path in the archiive-face-weights volume.
+            print("Fetching inswapper_128.onnx from HF mirror ...")
+            os.makedirs(os.path.dirname(swapper_path), exist_ok=True)
+            from huggingface_hub import hf_hub_download
+            import shutil
+            downloaded = hf_hub_download(
+                repo_id="ezioruan/inswapper_128.onnx",
+                filename="inswapper_128.onnx",
+                token=os.environ.get("HF_TOKEN"),
+            )
+            shutil.copy(downloaded, swapper_path)
+            face_volume.commit()
+            print("inswapper cached.")
+        else:
+            print("Loading inswapper from cache...")
+
+        self.face_swapper = insightface.model_zoo.get_model(
+            swapper_path, providers=["CPUExecutionProvider"]
+        )
+        print("InsightFace loaded successfully.")
+
+    def swap_face(self, target_image, source_image):
+        """Swap the face from `source_image` (the real person) onto `target_image`
+        (the FLUX output), aligned by facial landmarks. Returns (PIL image, status).
+        On any missing-face case the target is returned unchanged so we never ship
+        a broken frame."""
         import numpy as np
+        import cv2
+        from PIL import Image
 
-        label_ids = self.CATEGORY_LABELS.get(category, [4, 5, 6, 7])
+        target_bgr = cv2.cvtColor(np.array(target_image), cv2.COLOR_RGB2BGR)
+        source_bgr = cv2.cvtColor(np.array(source_image), cv2.COLOR_RGB2BGR)
 
-        inputs = self.seg_processor(images=image, return_tensors="pt")
-        with torch.no_grad():
-            logits = self.seg_model(**inputs).logits  # (1, C, h, w)
+        source_faces = self.face_app.get(source_bgr)
+        if not source_faces:
+            return target_image, "skipped: no face in person image"
+        target_faces = self.face_app.get(target_bgr)
+        if not target_faces:
+            return target_image, "skipped: no face in FLUX output"
 
-        # Upsample logits back to the original image resolution, then argmax.
-        upsampled = torch.nn.functional.interpolate(
-            logits, size=image.size[::-1], mode="bilinear", align_corners=False
-        )
-        seg = upsampled.argmax(dim=1)[0].cpu().numpy()
+        # Pick the largest face in each (most likely the subject).
+        def largest(faces):
+            return max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
 
-        region = np.isin(seg, label_ids)
-        if not region.any():
-            return None
-        return region
+        source_face = largest(source_faces)
+        target_face = largest(target_faces)
 
-    def garment_composite_mask(self, stage1_image, category):
-        """Build the composite mask from the Stage 1 garment region so FLUX detail
-        covers the WHOLE garment (this is what makes the result detailed). The edge
-        is feathered INWARD only — clamped to the region, with no outward dilation —
-        so the soft edge never spills below the hem, which is what previously leaked
-        a hallucinated orange waistband."""
-        import numpy as np
-        from PIL import Image, ImageFilter
-
-        region = self.segment_garment_region(stage1_image, category)
-        if region is None:
-            return None  # no garment in Stage 1 → nothing safe to composite onto
-
-        region255 = (region.astype(np.uint8) * 255)
-        feathered = Image.fromarray(region255, mode="L").filter(ImageFilter.GaussianBlur(6))
-        # Clamp the feather to inside the original region: full-strength FLUX across
-        # the interior, a soft inner edge, and zero spill past the hem.
-        clamped = np.minimum(np.array(feathered), region255)
-        return Image.fromarray(clamped, mode="L")
+        result_bgr = self.face_swapper.get(target_bgr, target_face, source_face, paste_back=True)
+        result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(result_rgb), "swapped"
 
     def remove_background(self, image, label="garment"):
         """Remove the background using rembg and paste onto a white backdrop."""
@@ -234,6 +247,7 @@ class HybridInference:
         num_timesteps = request.get("num_timesteps", 50)
         guidance_scale = request.get("guidance_scale", 2.0)
         flux_steps = request.get("flux_steps", 28)
+        face_swap = request.get("face_swap", True)
         white_background = request.get("white_background", True)
         debug = request.get("debug", False)
 
@@ -248,6 +262,7 @@ class HybridInference:
         garment_clean = self.remove_background(garment_image)
 
         # ============= Stage 1 — FASHN VTON =============
+        # Produces the fitted try-on that conditions FLUX (not shown to the user).
         print("Stage 1: FASHN VTON — fitting garment to person...")
 
         # Share the seed with FASHN so "regenerate" varies the fit too, and a
@@ -265,11 +280,10 @@ class HybridInference:
         print("Stage 1 complete.")
 
         # ============= Stage 2 — FLUX.2 [klein] garment detail enhancement =============
-        print("Stage 2: FLUX.2 [klein] — enhancing garment detail (masked)...")
+        # This is the base result the user wants. Generate at the person's true
+        # aspect ratio — forcing a square canvas stretched the body ('fat'/compressed).
+        print("Stage 2: FLUX.2 [klein] — enhancing garment detail...")
 
-        # Generate at the person's true aspect ratio. Forcing a square canvas is
-        # what stretched the body horizontally (the 'fat'/compressed bug); FLUX
-        # editing is a full regeneration, so the canvas shape directly shapes the body.
         base_w, base_h = stage1_result.size
         gen_w, gen_h = flux_dims(base_w, base_h)
 
@@ -300,36 +314,24 @@ class HybridInference:
 
         print("Stage 2 (FLUX) generation complete.")
 
-        # ============= Composite — only the garment region comes from FLUX =============
-        # Diffusers has no FLUX.2 inpaint pipeline yet, so we mask manually: take the
-        # enhanced garment pixels from FLUX (full detail across the garment) and keep
-        # face/body/proportions/background from the correctly-proportioned Stage 1
-        # result. The mask is feathered inward only, so FLUX content never spills
-        # below the hem (which is what previously leaked an orange waistband).
-        flux_aligned = flux_out.resize((base_w, base_h), Image.LANCZOS)
+        # Work at the person's native resolution from here on.
+        flux_result = flux_out.resize((base_w, base_h), Image.LANCZOS)
 
-        garment_mask = None
-        try:
-            garment_mask = self.garment_composite_mask(stage1_result, category)
-        except Exception as e:
-            print(f"Garment segmentation failed: {e}")
-
-        if garment_mask is None:
-            # Nothing safe to composite onto — return the well-proportioned Stage 1
-            # result rather than a full FLUX regeneration that may distort the body.
-            print("No garment mask detected — returning Stage 1 result.")
-            final_result = stage1_result
-        else:
-            import numpy as np
-
-            base_arr = np.array(stage1_result).astype(np.float32)
-            flux_arr = np.array(flux_aligned).astype(np.float32)
-            m = np.array(garment_mask).astype(np.float32) / 255.0
-            m3 = m[..., None]
-
-            composited = (flux_arr * m3 + base_arr * (1.0 - m3)).astype(np.uint8)
-            final_result = Image.fromarray(composited)
-            print("Composite complete — face, body and background preserved from Stage 1.")
+        # ============= Stage 3 — Face swap =============
+        # FLUX gives the garment/texture we want but alters the face. We keep the
+        # FLUX image whole (so no body-merge artifacts like the clipped shoulder /
+        # texture seams) and swap only the face — the real one from the person photo,
+        # landmark-aligned by the swap model.
+        swap_status = "disabled"
+        final_result = flux_result
+        if face_swap:
+            print("Stage 3: Face swap — restoring the person's identity...")
+            try:
+                final_result, swap_status = self.swap_face(flux_result, person_image)
+            except Exception as e:
+                print(f"Face swap failed: {e}")
+                final_result, swap_status = flux_result, f"error: {e}"
+            print(f"Face swap: {swap_status}")
 
         # Optionally drop the subject onto a clean white backdrop.
         if white_background:
@@ -340,15 +342,13 @@ class HybridInference:
             img.save(buf, format="PNG")
             return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-        # Return the seed so the front end can display it and let users pin /
-        # reproduce a result they liked.
-        response = {"image": encode_png(final_result), "seed": seed}
+        # Return the seed (for pin/regenerate) and the face-swap status.
+        response = {"image": encode_png(final_result), "seed": seed, "face_swap": swap_status}
 
-        # In debug mode, also return the raw Stage 1 (FASHN) and FLUX outputs so
-        # we can see which stage a hem/fit artifact actually comes from.
+        # In debug mode, also return the raw Stage 1 (FASHN) and FLUX outputs.
         if debug:
             response["stage1_image"] = encode_png(stage1_result)
-            response["flux_image"] = encode_png(flux_aligned)
+            response["flux_image"] = encode_png(flux_result)
 
         return response
 
@@ -380,6 +380,7 @@ async def try_on(request: TryOnRequest):
         "guidance_scale": request.guidance_scale,
         "flux_steps": request.flux_steps,
         "seed": request.seed,
+        "face_swap": request.face_swap,
         "white_background": request.white_background,
         "debug": request.debug,
     })
