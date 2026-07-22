@@ -46,7 +46,7 @@ An earlier version of Stage 3 tried to *composite* the FLUX garment onto the FAS
 | [`inputs/`](inputs/), [`outputs/`](outputs/) | Local scratch space for test images and generated results (gitignored contents) |
 | [`b64encoder.py`](b64encoder.py), [`b64decoder.py`](b64decoder.py) | Early manual dev tools for base64-encoding request images / decoding response images before `test_pipeline.py` automated the loop |
 
-### Design decisions worth calling out
+### Design
 
 - **Serverless GPU via Modal**: each service defines its container image, model-weight volumes, and endpoint declaratively (`modal.Image`, `modal.Volume`, `@modal.asgi_app`). Weights are downloaded once per volume and cached, so cold starts don't re-pull multi-GB checkpoints.
 - **Aspect-ratio-safe generation** (`flux_dims` in [`hybrid-ml/app.py`](hybrid-ml/app.py)): forcing FLUX onto a square canvas stretched portrait subjects ("fat"/compressed bug). Dimensions are now scaled to a FLUX-valid multiple-of-16 while preserving the person's true aspect ratio.
@@ -97,4 +97,4 @@ See the docstring at the top of [`test_pipeline.py`](hybrid-ml/test_pipeline.py)
 
 ## Related
 
-Front-end / product repo: [archiive](https://github.com/ayoaru/archiive)
+Front-end / Product repo: [archiive](https://github.com/ayoaru/archiive)
