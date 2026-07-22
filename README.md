@@ -58,9 +58,9 @@ An earlier version of Stage 3 tried to *composite* the FLUX garment onto the FAS
 
 `inswapper_128.onnx` (Stage 3) has murky commercial licensing and was chosen to validate the visual approach quickly. It's flagged as a pre-launch swap-out for a commercially licensed face-swap model or API.
 
-## Roadmap / build log
+## Roadmap / Build Log
 
-Reverse-chronological summary of how the pipeline evolved, from initial commit to current state:
+Summary of how the pipeline evolved, from initial commit to current state:
 
 1. **Base FLUX model + API endpoints** — initial FastAPI/Modal scaffold, single-model image generation.
 2. **FLUX two-stage pipeline** — split generation into outfit synthesis + face inpainting (MediaPipe face detection/masking) to fix identity drift from a single generation pass.
